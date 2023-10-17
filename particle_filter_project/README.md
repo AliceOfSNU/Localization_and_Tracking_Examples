@@ -3,6 +3,15 @@
 This repository implements the monte-carlo localization algorithm
 for the Turtlebot3 equipped with a 360-degree range sensor
   
+![Alt text](gazebo_demo.png)
+
+
+In addition to the original requirements, I have varied the number of particles over time, starting from a large number to allow global localization and then scaling down by halves for speedup.
+
+- sensor model: likelihood field
+
+    weights each particle by the likelihood of actual laser measurement given the particle's expectation of the measurement, calculated from its location and the (known)map.
+
 ![Alt text](image.png)
 
 ### Dependencies
@@ -43,3 +52,11 @@ Finally, the particle filter algorithm
 ```
 rosrun particle_filter_project particle_filter.py
 ```
+
+### issues
+
+**In slow computers, the simulation may not run quickly enough and something like**
+```
+tf2.TransformException: Lookup would require extrapolation x.xxs into the past.
+```
+**may show up. Try to adjust the num_particles property.**

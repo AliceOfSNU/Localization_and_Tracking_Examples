@@ -62,9 +62,9 @@ def inverse_transform_point(vec, yaw):
     return(np.cos(yaw)*vec[0] -np.sin(yaw)*vec[1], np.sin(yaw)*vec[0]+np.cos(yaw)*vec[1])
 
 def normalize_angle(yaw):
-    while yaw < 0:
+    while yaw <= -np.pi:
         yaw += 2*np.pi
-    while yaw >= 2*np.pi:
+    while yaw > np.pi:
         yaw -= 2*np.pi
     return yaw
 
@@ -107,7 +107,7 @@ class ParticleFilter:
 
         # inialize our map and occupancy field
         self.map = OccupancyGrid()
-        self.num_particles = 200
+        self.num_particles = 5000
         self.particle_weights = [1.0/self.num_particles] * self.num_particles
         self.particle_cloud = []
         self.robot_estimate = Pose()
@@ -117,7 +117,7 @@ class ParticleFilter:
         self.ang_mvmt_threshold = (np.pi / 6)
 
         self.odom_pose_last_motion_update = None
-
+        self.frame_cnt = 0
         # noise moodel
         self.pos_sigma = 0.1
         self.angle_sigma = 0.01
@@ -164,7 +164,7 @@ class ParticleFilter:
     def normalize_particles(self):
         # make all the particle weights sum to 1.0
         sum_weights = np.sum(self.particle_weights)
-        print("weights sum to : ", sum_weights)
+        print("weights of ", self.num_particles, "particles sum to : ", sum_weights)
         for (i, pt) in enumerate(self.particle_cloud):
             pt.w /= sum_weights
             self.particle_weights[i] = pt.w
@@ -189,17 +189,16 @@ class ParticleFilter:
 
 
     def resample_particles(self):
-        assert(len(self.particle_cloud) == self.num_particles)
-        assert(np.abs(np.sum(self.particle_weights) - 1.0) < 1.0e-7)
+        assert(np.abs(np.sum(self.particle_weights) - 1.0) < 1.0e-3)
         self.particle_cloud = draw_random_sample(self.particle_cloud, self.particle_weights, self.num_particles)
-        
+        self.particle_weights = self.particle_weights[:self.num_particles]
         # noise model: gaussian
+        gaussian_noise = np.random.multivariate_normal([0.0, 0.0, 0.0], self.motion_noise, self.num_particles)
         for i, pt in enumerate(self.particle_cloud):
-            gaussian_noise = np.random.multivariate_normal([0.0, 0.0, 0.0], self.motion_noise, self.num_particles)
             yaw = get_yaw_from_pose(pt.pose)
             pt.pose = make_pose(pt.pose.position.x + gaussian_noise[i, 0], pt.pose.position.y + gaussian_noise[i, 1], yaw + gaussian_noise[i, 2])
-            
-        assert(len(self.particle_cloud) == self.num_particles)
+        
+        
 
     def robot_scan_received(self, data):
 
@@ -218,18 +217,11 @@ class ParticleFilter:
             return
 
         # calculate the pose of the laser distance sensor 
-        p = PoseStamped(
-            header=Header(stamp=rospy.Time(0),
-                          frame_id=data.header.frame_id))
-
+        p = PoseStamped(header=Header(stamp=rospy.Time(0), frame_id=data.header.frame_id))
         self.laser_pose = self.tf_listener.transformPose(self.base_frame, p)
 
         # determine where the robot thinks it is based on its odometry
-        p = PoseStamped(
-            header=Header(stamp=data.header.stamp,
-                          frame_id=self.base_frame),
-            pose=Pose())
-
+        p = PoseStamped(header=Header(stamp=data.header.stamp, frame_id=self.base_frame), pose=Pose())
         self.odom_pose = self.tf_listener.transformPose(self.odom_frame, p)
         
         # we need to be able to compare the current odom pose to the prior odom pose
@@ -238,11 +230,9 @@ class ParticleFilter:
             self.odom_pose_last_motion_update = self.odom_pose
             return
 
-
         if self.particle_cloud:
-
-            # check to see if we've moved far enough to perform an update
-
+            self.frame_cnt += 1
+            
             curr_x = self.odom_pose.pose.position.x
             old_x = self.odom_pose_last_motion_update.pose.position.x
             curr_y = self.odom_pose.pose.position.y
@@ -254,18 +244,22 @@ class ParticleFilter:
                 np.abs(curr_y - old_y) > self.lin_mvmt_threshold or
                 np.abs(curr_yaw - old_yaw) > self.ang_mvmt_threshold):
 
-                # This is where the main logic of the particle filter is carried out
-
+                # DONE
                 self.update_particles_with_motion_model()
-
+                # DONE
                 self.update_particle_weights_with_measurement_model(data)
-
+                # DONE
+                
+                if self.frame_cnt > 3 and self.num_particles > 2000:
+                    self.num_particles //= 2
+                    
                 self.normalize_particles()
-
+                # DONE
+                    
                 self.resample_particles()
-
+                # DONE
                 self.update_estimated_robot_pose()
-
+                # DONE
                 self.publish_particle_cloud()
                 self.publish_estimated_robot_pose()
 
@@ -285,9 +279,10 @@ class ParticleFilter:
 
     
     def update_particle_weights_with_measurement_model(self, data):
-        angles = [i*len(data.ranges)//4 for i in range(4)] # 0, pi/2, pi, 3*pi/2
+        angles = [i*len(data.ranges)//36 for i in range(36)] # 0, pi/2, pi, 3*pi/2
         (x_range, y_range) = self.likelihood_field.get_obstacle_bounding_box()
-        assert(len(self.particle_cloud) == self.num_particles)        
+        nan_cnt = 0
+        
         for i, pt in enumerate(self.particle_cloud):
             # first prune if out of bounds
             if pt.pose.position.x > x_range[1] or pt.pose.position.x < x_range[0] or pt.pose.position.y > y_range[1] or pt.pose.position.y < y_range[0]:
@@ -299,8 +294,9 @@ class ParticleFilter:
             for scan_idx in angles:
                 _, _, pt_angle = euler_from_quaternion([pt.pose.orientation.x, pt.pose.orientation.y, pt.pose.orientation.z, pt.pose.orientation.w])
                 z_scan = data.ranges[scan_idx]
-                if z_scan == math.inf: 
-                    #continue
+                if z_scan == math.inf or z_scan > 1e9 or not z_scan: 
+                    # did not detect? skip this one
+                    continue
                     z_scan = data.range_max
                 
                 # need not scale angles here
@@ -309,11 +305,17 @@ class ParticleFilter:
                 y_expected = pt.pose.position.y + z_scan * np.sin(pt_angle + scan_angle)
                 
                 # if out of map...
+                #z_scan_scaled = z_scan
+                #while x_expected > x_range[1] or x_expected < x_range[0] or y_expected > y_range[1] or y_expected < y_range[0]: 
+                #    z_scan_scaled -= 0.2*z_scan
+                #    x_expected = pt.pose.position.x + z_scan_scaled * np.cos(pt_angle + scan_angle)
+                #    y_expected = pt.pose.position.y + z_scan_scaled * np.sin(pt_angle + scan_angle)
                 if x_expected > x_range[1] or x_expected < x_range[0] or y_expected > y_range[1] or y_expected < y_range[0]: 
-                    x_expected = pt.pose.position.x
-                    y_expected = pt.pose.position.y
+                    q = 0
+                    continue
+                else:
+                    dist = self.likelihood_field.get_closest_obstacle_distance(x_expected, y_expected)
                 
-                dist = self.likelihood_field.get_closest_obstacle_distance(x_expected, y_expected)
                 if dist == np.nan or dist == float('nan'):
                     # a sensible replacement for dist when (x,y) is out of map.
                     dist = z_scan if z_scan != math.inf else data.range_max
@@ -359,7 +361,7 @@ class ParticleFilter:
             
 
     def run(self):
-        r = rospy.Rate(1)
+        r = rospy.Rate(1.5)
         while not rospy.is_shutdown():
             self.publish_particle_cloud()
             r.sleep()
@@ -368,11 +370,6 @@ if __name__=="__main__":
     pf = ParticleFilter()
     pf.run()
     #rospy.spin()
-
-
-
-
-
 
 
 
